@@ -1,4 +1,5 @@
 
+import "dotenv/config";
 import Groq from "groq-sdk";
 
 import { webSearch } from "./tools/webSearch.js";
@@ -11,23 +12,101 @@ const groq = new Groq({
 });
 
 const MODEL = "openai/gpt-oss-120b";
-const MAX_STEPS = 8;
+const MAX_STEPS = 5;
 
-// All tools accept exactly one required argument: query.
-const tools: Groq.Chat.Completions.ChatCompletionTool[] = [
+const SYSTEM_PROMPT = `
+You are an accurate AI Research Assistant.
+
+Your job is to answer research questions using the available tools:
+1. web_search
+2. knowledge_lookup
+3. database_query
+
+RESEARCH RULES:
+- Understand the user's question before answering.
+- Use the available tools when external information, stored knowledge, or database records are relevant.
+- You may call multiple tools when necessary.
+- Never invent facts, sources, statistics, or references.
+- Use information returned by tools as evidence.
+- If the available information is insufficient, clearly state that.
+- Do not claim that a tool was used unless it was actually called.
+- Provide a clear, structured answer.
+- Avoid unnecessary repetition.
+
+STRICT MARKDOWN FORMATTING RULES:
+
+1. GENERAL FORMATTING
+- Use Markdown headings to organize long answers.
+- Use bullet points for lists of related information.
+- Use numbered lists for sequential steps or processes.
+- Use bold text only for important terms and key points.
+- Keep paragraphs short and readable.
+
+2. TABLE CREATION
+- Use a Markdown table when the user asks for a comparison, differences, features, advantages, disadvantages, or structured data.
+- Do not create a table when normal paragraphs or bullet points are more suitable.
+- Every table MUST have a header row.
+- Every header row MUST be followed immediately by a Markdown separator row.
+- Use the pipe character (|) to separate columns.
+- Every row MUST contain exactly the same number of columns.
+- Keep table cells concise and easy to understand.
+- Do not put multi-paragraph content inside table cells.
+- Do not put nested Markdown tables inside table cells.
+- Do not insert blank lines between table rows.
+- Do not use HTML table tags.
+- Do not put the entire table inside a code block.
+- Do not write explanatory text in place of the actual table.
+- Use a short heading before a table when appropriate.
+- Add a short explanation after the table when useful.
+
+3. CORRECT MARKDOWN TABLE STRUCTURE
+
+Always follow this pattern:
+
+| Aspect | Option A | Option B |
+|---|---|---|
+| Purpose | Description A | Description B |
+| Main Feature | Feature A | Feature B |
+| Advantage | Advantage A | Advantage B |
+| Limitation | Limitation A | Limitation B |
+
+4. TABLE QUALITY
+- Keep column names short and meaningful.
+- Keep each cell focused on one point.
+- Use consistent terminology throughout the table.
+- Do not leave unnecessary empty cells.
+- If a table becomes too wide, simplify the columns or use bullet points instead.
+- Never output a table with missing separator lines.
+- Never output rows with a different number of columns.
+
+5. SOURCES
+- When web search results provide URLs, include relevant source links.
+- Do not invent URLs or citations.
+- Clearly distinguish tool-supported facts from information that could not be verified.
+
+6. FINAL ANSWER
+- Start with a direct answer or brief overview.
+- Organize detailed information using suitable headings.
+- Include a comparison table when the user explicitly requests one.
+- End with a concise conclusion or key takeaway when appropriate.
+
+IMPORTANT:
+The final answer must be readable, factually accurate, and correctly formatted.
+`;
+
+const tools = [
   {
-    type: "function",
+    type: "function" as const,
     function: {
       name: "web_search",
       description:
-        "Search the internet for current information. You MUST provide a non-empty query string. Do not provide cursor, id, or other parameters.",
-      strict: true,
+        "Search the web for current information related to a research question.",
       parameters: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description: "A clear search query describing what information to find.",
+            description: "The search query.",
           },
         },
         required: ["query"],
@@ -36,18 +115,17 @@ const tools: Groq.Chat.Completions.ChatCompletionTool[] = [
     },
   },
   {
-    type: "function",
+    type: "function" as const,
     function: {
       name: "knowledge_lookup",
       description:
-        "Search the internal AI knowledge base. You MUST provide a non-empty query string.",
-      strict: true,
+        "Search the internal knowledge base for relevant information.",
       parameters: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description: "The topic to find in the internal knowledge base.",
+            description: "The knowledge search query.",
           },
         },
         required: ["query"],
@@ -56,18 +134,17 @@ const tools: Groq.Chat.Completions.ChatCompletionTool[] = [
     },
   },
   {
-    type: "function",
+    type: "function" as const,
     function: {
       name: "database_query",
       description:
-        "Search stored research records. You MUST provide a non-empty query string.",
-      strict: true,
+        "Search the research database for relevant stored records.",
       parameters: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description: "The research topic to find in the database.",
+            description: "The database search query.",
           },
         },
         required: ["query"],
@@ -77,113 +154,80 @@ const tools: Groq.Chat.Completions.ChatCompletionTool[] = [
   },
 ];
 
-interface ToolArguments {
-  query: string;
+interface AgentUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
 }
 
-function parseToolArguments(argumentsText: string): ToolArguments {
-  let parsed: unknown;
+interface CacheMetrics {
+  cachedTokens: number;
+  cacheMissTokens: number;
+  cacheHitRate: number;
+}
 
-  try {
-    parsed = JSON.parse(argumentsText);
-  } catch {
-    throw new Error("The model returned invalid JSON tool arguments.");
-  }
-
-  if (
-    typeof parsed !== "object" ||
-    parsed === null ||
-    Array.isArray(parsed)
-  ) {
-    throw new Error("Tool arguments must be a JSON object.");
-  }
-
-  const args = parsed as Record<string, unknown>;
-
-  if (
-    typeof args.query !== "string" ||
-    !args.query.trim()
-  ) {
-    throw new Error("Tool arguments must contain a non-empty query.");
-  }
-
-  return {
-    query: args.query.trim(),
+interface AgentResult {
+  answer: string;
+  toolsUsed: string[];
+  usage: AgentUsage;
+  cache: CacheMetrics;
+  cost: {
+    inputCost: number;
+    outputCost: number;
+    totalCost: number;
+    currency: string;
   };
 }
 
 async function executeTool(
-  name: string,
-  query: string
+  toolName: string,
+  argumentsJson: string
 ): Promise<unknown> {
-  if (typeof query !== "string" || !query.trim()) {
-    throw new Error("Tool query must be a non-empty string.");
+  let args: { query?: string };
+
+  try {
+    args = JSON.parse(argumentsJson) as { query?: string };
+  } catch {
+    throw new Error("Invalid JSON arguments received from the model.");
   }
 
-  const cleanQuery = query.trim();
+  const query = args.query?.trim();
 
-  switch (name) {
+  if (!query) {
+    throw new Error("A valid non-empty query is required.");
+  }
+
+  switch (toolName) {
     case "web_search":
-      return await webSearch(cleanQuery);
+      return await webSearch(query);
 
     case "knowledge_lookup":
-      return knowledgeLookup(cleanQuery);
+      return knowledgeLookup(query);
 
     case "database_query":
-      return databaseQuery(cleanQuery);
+      return databaseQuery(query);
 
     default:
-      throw new Error(`Unknown tool: ${name}`);
+      throw new Error(`Unknown tool: ${toolName}`);
   }
 }
 
-export async function runResearchAgent(question: string) {
+export async function runResearchAgent(
+  question: string
+): Promise<AgentResult> {
   if (!question || !question.trim()) {
-    throw new Error("Please provide a research question.");
+    throw new Error("Please provide a valid research question.");
   }
 
   if (!process.env.GROQ_API_KEY) {
-    throw new Error("Groq API key is not configured.");
+    throw new Error("GROQ_API_KEY is not configured.");
   }
 
-  const messages: Groq.Chat.Completions.ChatCompletionMessageParam[] = [
+  // The message list contains the conversation and tool results.
+  const messages: any[] = [
     {
       role: "system",
-      content: `
-You are an AI research assistant.
-
-You have access to exactly three tools:
-
-1. web_search
-   Required argument: {"query": "your search topic"}
-
-2. knowledge_lookup
-   Required argument: {"query": "your knowledge topic"}
-
-3. database_query
-   Required argument: {"query": "your database search topic"}
-
-IMPORTANT TOOL RULES:
-- Always provide the required query argument when calling a tool.
-- The query must be a non-empty string.
-- Never send cursor, id, page, or other arguments.
-- Use each available tool at most once for the current question.
-- Do not repeat a tool call when its result is already available.
-- When the relevant tool results are received, stop calling tools.
-- Combine the available results and provide the final answer.
-- Never continue searching unnecessarily.
-
-ANSWER RULES:
-- Base answers on tool results whenever available.
-- Clearly distinguish sourced information from general knowledge.
-- Use clear headings and bullet points.
-- When creating tables, use valid GitHub Flavored Markdown.
-- Put every table row on a separate line.
-- Include a Markdown separator row after the table header.
-- Do not use HTML tags inside tables.
-- Keep answers accurate, clear, and well structured.
-- Never invent sources or research findings.
-      `,
+      content: SYSTEM_PROMPT,
     },
     {
       role: "user",
@@ -191,9 +235,8 @@ ANSWER RULES:
     },
   ];
 
-  const toolCallsUsed: string[] = [];
+  const toolsUsed = new Set<string>();
 
-  // Track usage across every model request.
   let promptTokens = 0;
   let completionTokens = 0;
   let totalTokens = 0;
@@ -205,11 +248,11 @@ ANSWER RULES:
       messages,
       tools,
       tool_choice: "auto",
-      parallel_tool_calls: false,
       reasoning_effort: "medium",
     });
 
-    const usage = completion.usage as unknown as
+    // Add token usage from every model request in the agent loop.
+    const usage = completion.usage as
       | {
           prompt_tokens?: number;
           completion_tokens?: number;
@@ -230,36 +273,49 @@ ANSWER RULES:
     const assistantMessage = completion.choices[0]?.message;
 
     if (!assistantMessage) {
-      throw new Error("The model returned an empty response.");
+      throw new Error("The AI model returned an empty response.");
     }
 
-    messages.push(assistantMessage);
+    // If there are no tool calls, the model has produced its final answer.
+    if (
+      !assistantMessage.tool_calls ||
+      assistantMessage.tool_calls.length === 0
+    ) {
+      const answer = assistantMessage.content;
 
-    // If there are no tool calls, return the final answer.
-    if (!assistantMessage.tool_calls?.length) {
+      if (typeof answer !== "string" || !answer.trim()) {
+        throw new Error("The AI model did not return a valid answer.");
+      }
+
       const safeCachedTokens = Math.min(
         cachedTokens,
         promptTokens
       );
 
-      // Apply the configured 50% cached-input discount.
-      const billableInputTokens =
-        promptTokens - safeCachedTokens * 0.5;
-
-      const cost = calculateCost({
-        promptTokens: billableInputTokens,
-        completionTokens,
-        totalTokens,
-      });
+      const cacheMissTokens = Math.max(
+        0,
+        promptTokens - safeCachedTokens
+      );
 
       const cacheHitRate =
         promptTokens > 0
           ? (safeCachedTokens / promptTokens) * 100
           : 0;
 
+      // Groq GPT-OSS 120B cached input tokens have a 50% discount.
+      // This calculation estimates the discounted input cost.
+      const billablePromptTokens =
+        promptTokens - safeCachedTokens * 0.5;
+
+      const cost = calculateCost({
+        promptTokens: billablePromptTokens,
+        completionTokens,
+        totalTokens,
+      });
+
       return {
-        answer: assistantMessage.content ?? "",
-        toolsUsed: [...new Set(toolCallsUsed)],
+        answer,
+        toolsUsed: Array.from(toolsUsed),
 
         usage: {
           promptTokens,
@@ -269,7 +325,7 @@ ANSWER RULES:
 
         cache: {
           cachedTokens: safeCachedTokens,
-          cacheMissTokens: promptTokens - safeCachedTokens,
+          cacheMissTokens,
           cacheHitRate: Number(cacheHitRate.toFixed(2)),
         },
 
@@ -277,52 +333,50 @@ ANSWER RULES:
       };
     }
 
-    // Execute tool calls one at a time.
+    // Add the assistant tool-call message to the conversation.
+    messages.push(assistantMessage);
+
+    // Execute every tool requested by the model.
     for (const toolCall of assistantMessage.tool_calls) {
+      if (toolCall.type !== "function") {
+        continue;
+      }
+
       const toolName = toolCall.function.name;
 
-      let toolResult: unknown;
-
       try {
-        const args = parseToolArguments(
+        const toolResult = await executeTool(
+          toolName,
           toolCall.function.arguments
         );
 
-        toolResult = await executeTool(
-          toolName,
-          args.query
-        );
+        toolsUsed.add(toolName);
 
-        toolCallsUsed.push(toolName);
-
-        console.log(`Tool executed successfully: ${toolName}`);
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(toolResult),
+        });
       } catch (error) {
         const errorMessage =
           error instanceof Error
             ? error.message
-            : "Unknown tool execution error.";
+            : "Tool execution failed.";
 
-        console.error(
-          `Tool execution failed (${toolName}):`,
-          errorMessage
-        );
-
-        toolResult = {
-          success: false,
-          tool: toolName,
-          error: errorMessage,
-        };
+        // Return the error to the model so it can continue safely.
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify({
+            error: errorMessage,
+            tool: toolName,
+          }),
+        });
       }
-
-      messages.push({
-        role: "tool",
-        tool_call_id: toolCall.id,
-        content: JSON.stringify(toolResult),
-      });
     }
   }
 
   throw new Error(
-    `Agent reached the maximum limit of ${MAX_STEPS} tool-calling steps.`
+    `The agent reached its maximum of ${MAX_STEPS} steps without producing a final answer.`
   );
 }
